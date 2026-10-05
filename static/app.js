@@ -557,6 +557,7 @@ async function loadPublished() {
   }
   empty.classList.add("hidden");
   content.classList.remove("hidden");
+  await loadVerifyPlans();
   // 已发布地址表来自发布时的不可变快照：发布后改名、切换锁定、调整保留区
   // 都不会改变此表与 CSV；仅旧库缺少快照的记录按字段来源裁决重建并提示——
   // 名称标注“当前名称”，无法还原的锁定状态显示“未知”而非“否”。
@@ -690,6 +691,139 @@ function renderPublishedMigrations(migrations) {
     </tr>`;
     })
     .join("");
+}
+
+// ---------- 现场地址核验 ----------
+// 已发布方案选择器：可选择任一已发布版本，核验以该版本发布时的落点为基准，
+// 灯具后来改名、删除或再次发布都不影响核验结果。
+async function loadVerifyPlans() {
+  const plans = await api("/api/plans/published");
+  const sel = $("#verify-plan-select");
+  sel.innerHTML = plans
+    .map((p) => {
+      const when = p.published_at ? new Date(p.published_at).toLocaleString("zh-CN") : "-";
+      return `<option value="${p.plan_id}">发布 #${p.plan_id} · 配置 v${p.config_version} · ${when}</option>`;
+    })
+    .join("");
+}
+
+$("#btn-verify").addEventListener("click", async () => {
+  const planId = $("#verify-plan-select").value;
+  const file = $("#verify-file").files[0];
+  if (!planId) return toast("请选择要核验的已发布方案", "error");
+  if (!file) return toast("请选择现场 CSV 文件", "error");
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    const report = await api(`/api/plans/${planId}/verify`, { method: "POST", body: form });
+    renderVerifyReport(report);
+  } catch (err) {
+    $("#verify-result").innerHTML = "";
+    toast(err.message, "error");
+  }
+});
+
+const VERIFY_FIELD_LABELS = { line: "线路", start: "起始地址", channels: "通道数" };
+
+// 渲染核验报告：整表结论横幅 + 逐项清单（隔离行/缺失/额外/不符/现场重叠）。
+// 地址差异（不符清单）与跨行重叠（现场区间重叠）分开展示，互不混入。
+function renderVerifyReport(r) {
+  const box = $("#verify-result");
+  const c = r.counts;
+  let html = "";
+  // 旧记录缺少快照时提示字段来源：名称/锁定/保留区不参与裁决
+  if (r.notice) {
+    html += `<div class="banner warn">${esc(r.notice)}</div>`;
+  }
+  const baselineNote = r.from_snapshot ? "发布快照" : "留存明细（无快照旧记录）";
+  if (r.consistent) {
+    html += `<div class="banner ok">✅ 整表一致：现场 ${c.checked} 台灯具与发布 #${r.plan_id}（基准：${baselineNote}）的落点完全一致。</div>`;
+  } else {
+    html += `<div class="banner err">❌ 整表不一致（基准：发布 #${r.plan_id}，${baselineNote}）——
+      缺失 ${c.missing} 台 · 额外 ${c.extra} 台 · 线路/地址/通道不符 ${c.mismatched} 台 ·
+      现场区间重叠 ${c.overlap_pairs} 处 · 隔离异常行 ${c.quarantined_rows} 行；
+      已按 ID 对齐核对 ${c.checked} 台，其中 ${c.matched} 台一致。</div>`;
+  }
+
+  if (r.quarantined.length) {
+    html += `
+      <h3>⚠️ 隔离异常行 <span class="count">${r.quarantined.length}</span></h3>
+      <p class="muted">以下行未参与对齐核对；只要存在隔离行，整表结论就不会是“一致”。</p>
+      <table class="data">
+        <thead><tr><th>行号</th><th>灯具ID</th><th>原始内容</th><th>隔离原因</th></tr></thead>
+        <tbody>${r.quarantined
+          .map(
+            (q) => `<tr><td>${q.row}</td><td>${q.fixture_id ?? "—"}</td>
+              <td><code>${esc(q.raw)}</code></td><td>${q.reasons.map(esc).join("；")}</td></tr>`
+          )
+          .join("")}</tbody>
+      </table>`;
+  }
+
+  if (r.missing.length) {
+    html += `
+      <h3>📭 缺失（发布有、现场无）<span class="count">${r.missing.length}</span></h3>
+      <table class="data">
+        <thead><tr><th>灯具ID</th><th>名称</th><th>线路</th><th>起始</th><th>结束</th><th>通道数</th></tr></thead>
+        <tbody>${r.missing
+          .map(
+            (m) => `<tr><td>${m.fixture_id}</td><td>${esc(m.name)}${publishedNameSuffix(m.name_source)}</td>
+              <td>${m.line_id}</td><td>${m.start}</td><td>${m.end}</td><td>${m.channels}</td></tr>`
+          )
+          .join("")}</tbody>
+      </table>`;
+  }
+
+  if (r.extra.length) {
+    html += `
+      <h3>➕ 额外（现场有、发布无）<span class="count">${r.extra.length}</span></h3>
+      <table class="data">
+        <thead><tr><th>行号</th><th>灯具ID</th><th>线路</th><th>起始</th><th>结束</th><th>通道数</th></tr></thead>
+        <tbody>${r.extra
+          .map(
+            (x) => `<tr><td>${x.row}</td><td>${x.fixture_id}</td>
+              <td>${x.line}</td><td>${x.start}</td><td>${x.end}</td><td>${x.channels}</td></tr>`
+          )
+          .join("")}</tbody>
+      </table>`;
+  }
+
+  if (r.mismatches.length) {
+    html += `
+      <h3>🔀 线路/地址/通道不符 <span class="count">${r.mismatches.length}</span></h3>
+      <table class="data">
+        <thead><tr><th>灯具ID</th><th>名称</th><th>现场行号</th><th>差异项</th><th>发布落点</th><th>现场值</th></tr></thead>
+        <tbody>${r.mismatches
+          .flatMap((m) =>
+            m.diffs.map(
+              (d) => `<tr><td>${m.fixture_id}</td><td>${esc(m.name)}${publishedNameSuffix(m.name_source)}</td>
+                <td>${m.row}</td><td>${VERIFY_FIELD_LABELS[d.field]}</td>
+                <td>${d.expected}</td><td class="diff-bad">${d.actual}</td></tr>`
+            )
+          )
+          .join("")}</tbody>
+      </table>`;
+  }
+
+  if (r.overlaps.length) {
+    html += `
+      <h3>🧨 现场区间重叠 <span class="count">${r.overlaps.length}</span></h3>
+      <p class="muted">同一线路上两台灯具的通道区间（闭区间）相交，与上方的地址差异无关，需现场排查。</p>
+      <table class="data">
+        <thead><tr><th>线路</th><th>灯具 A</th><th>区间 A</th><th>灯具 B</th><th>区间 B</th><th>重叠区间</th></tr></thead>
+        <tbody>${r.overlaps
+          .map(
+            (o) => `<tr><td>${o.line}</td>
+              <td>#${o.a.fixture_id}（行 ${o.a.row}）</td><td>${o.a.start}-${o.a.end}</td>
+              <td>#${o.b.fixture_id}（行 ${o.b.row}）</td><td>${o.b.start}-${o.b.end}</td>
+              <td class="diff-bad">${o.overlap_start}-${o.overlap_end}</td></tr>`
+          )
+          .join("")}</tbody>
+      </table>`;
+  }
+
+  box.innerHTML = html;
+  box.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 // ---------- 启动 ----------

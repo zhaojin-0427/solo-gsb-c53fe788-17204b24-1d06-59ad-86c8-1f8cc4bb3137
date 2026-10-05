@@ -157,6 +157,23 @@
           <thead><tr><th>灯具ID</th><th>名称</th><th>线路</th><th>起始</th><th>结束</th><th>通道数</th><th>迁移</th><th>锁定</th></tr></thead>
           <tbody id="published-tbody"></tbody>
         </table>
+
+        <!-- 现场地址核验 -->
+        <h2>现场地址核验</h2>
+        <div id="verify-panel">
+          <p class="muted">
+            选择任一已发布方案，上传现场 CSV（需含表头：<code>灯具ID,线路,起始地址,通道数</code>；
+            兼容本系统导出的地址表 CSV，多余列自动忽略）。服务端以所选方案发布时的落点为基准，
+            按灯具 ID 对齐并计算闭区间；坏行、非法线路、越过 512 通道或重复 ID 的行会被隔离并逐项列出，
+            且只要存在异常行整表结论就不会是“一致”。核验为只读操作，不修改编排与发布数据。
+          </p>
+          <div class="toolbar">
+            <select id="verify-plan-select"></select>
+            <input type="file" id="verify-file" accept=".csv,text/csv" />
+            <button id="btn-verify" class="primary">上传并核验</button>
+          </div>
+          <div id="verify-result"></div>
+        </div>
       </div>
     </section>
   </main>

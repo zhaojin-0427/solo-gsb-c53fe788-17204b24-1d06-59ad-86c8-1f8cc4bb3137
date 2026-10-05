@@ -137,6 +137,33 @@
           <a id="btn-download-csv" class="button-like" download>⬇ 下载已发布地址表 CSV</a>
         </div>
         <div id="published-notice" class="banner warn hidden"></div>
+
+        <!-- 现场地址核验：以所选已发布版本的发布快照/留存落点为基准的只读比对 -->
+        <div id="verify-panel" class="verify-panel">
+          <h2>🔎 现场地址核验</h2>
+          <p class="muted">
+            上传现场导出的 CSV（列：<code>灯具ID,线路,起始地址,通道数</code>，闭区间按 起始地址..起始地址+通道数−1 计算），
+            服务端以所选发布版本的<strong>发布快照（无快照时为留存明细落点）</strong>为基准，按灯具 ID 对齐核对；
+            灯具后来改名、删除或再次发布均不改变该版本的基准；保留区与名称不参与裁决。核验不会修改任何编排或发布数据。
+          </p>
+          <div class="toolbar">
+            <label class="verify-field">基准方案
+              <select id="verify-plan-select"></select>
+            </label>
+            <label class="verify-field">异常处理
+              <select id="verify-mode-select">
+                <option value="isolate">隔离异常行继续核对（结果不会判为一致）</option>
+                <option value="strict">整表拒收（有任一异常行即不核对）</option>
+              </select>
+            </label>
+            <input type="file" id="verify-file" accept=".csv,text/csv" />
+            <button id="btn-verify" class="primary">上传并核验</button>
+            <button id="btn-verify-template">下载基准模板 CSV</button>
+            <span id="verify-hint" class="muted"></span>
+          </div>
+          <div id="verify-result" class="hidden"></div>
+        </div>
+
         <h2>线路占用</h2>
         <div id="published-tracks"></div>
         <div class="legend">

@@ -9,6 +9,7 @@ const state = {
   version: null,
   latestPublishedPlanId: null,
   preview: null, // 当前展示的预览 payload（feasible 时）
+  publishedPlans: [], // 已发布方案列表（现场核验基准选择）
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -548,6 +549,8 @@ function publishedNameSuffix(source) {
 
 async function loadPublished() {
   const data = await api("/api/plans/published/latest");
+  // 同步拉取已发布方案清单，填充现场核验的基准选择（保留当前选择）
+  await loadPublishedPlans(data.has_published ? data.plan_id : null);
   const empty = $("#published-empty");
   const content = $("#published-content");
   if (!data.has_published) {
@@ -690,6 +693,225 @@ function renderPublishedMigrations(migrations) {
     </tr>`;
     })
     .join("");
+}
+
+// ---------- 现场地址核验 ----------
+async function loadPublishedPlans(preferId = null) {
+  state.publishedPlans = await api("/api/plans/published");
+  const sel = $("#verify-plan-select");
+  const prev = sel.value || String(preferId ?? "");
+  sel.innerHTML = state.publishedPlans
+    .map((p) => {
+      const when = new Date(p.published_at).toLocaleString("zh-CN");
+      const src = p.from_snapshot ? "快照" : "旧记录落点";
+      return `<option value="${p.id}">#${p.id} · v${p.config_version} · ${when} · ${p.fixture_count} 台（${src}）</option>`;
+    })
+    .join("");
+  if (prev && state.publishedPlans.some((p) => String(p.id) === prev)) {
+    sel.value = prev;
+  } else if (state.publishedPlans.length) {
+    sel.value = String(state.publishedPlans[0].id);
+  }
+  updateVerifyHint();
+}
+
+function updateVerifyHint() {
+  const p = state.publishedPlans.find((x) => String(x.id) === $("#verify-plan-select").value);
+  $("#verify-hint").textContent = p
+    ? `基准：#${p.id} 共 ${p.fixture_count} 台灯，来源 ${p.from_snapshot ? "发布快照" : "旧记录留存落点"}`
+    : "";
+}
+
+$("#verify-plan-select").addEventListener("change", updateVerifyHint);
+
+function csvBlob(rows) {
+  return new Blob(["﻿" + rows], { type: "text/csv;charset=utf-8" });
+}
+
+// 模板：以所选方案的基准落点预填，供现场人员核对/替换为实测值
+$("#btn-verify-template").addEventListener("click", async () => {
+  const planId = $("#verify-plan-select").value;
+  if (!planId) return toast("尚无已发布方案可作为基准", "error");
+  try {
+    const data = await api(`/api/plans/${planId}`);
+    const lines = ["灯具ID,线路,起始地址,通道数"];
+    for (const a of data.allocations) {
+      lines.push(`${a.fixture_id},${a.line_id},${a.start},${a.channels}`);
+    }
+    const url = URL.createObjectURL(csvBlob(lines.join("\r\n") + "\r\n"));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `verify_template_plan${planId}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    toast(err.message, "error");
+  }
+});
+
+$("#btn-verify").addEventListener("click", async () => {
+  const planId = $("#verify-plan-select").value;
+  const fileInput = $("#verify-file");
+  const file = fileInput.files[0];
+  if (!planId) return toast("请先发布至少一个方案", "error");
+  if (!file) return toast("请选择现场 CSV 文件", "error");
+  const btn = $("#btn-verify");
+  btn.disabled = true;
+  btn.textContent = "核验中…";
+  try {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("mode", $("#verify-mode-select").value);
+    const res = await fetch(`/api/plans/${planId}/verify`, { method: "POST", body: fd });
+    const text = await res.text();
+    const data = text ? JSON.parse(text) : null;
+    if (res.status === 404) throw new Error(typeof data.detail === "string" ? data.detail : "方案不存在或尚未发布");
+    if (!res.ok && !(res.status === 422 && data && data.verdict)) {
+      const detail = data && data.detail ? data.detail : `HTTP ${res.status}`;
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+    // 422 + verdict=rejected 表示“整表拒收”，页面同样渲染完整异常清单
+    renderVerifyResult(data);
+  } catch (err) {
+    toast(err.message, "error");
+    $("#verify-result").classList.add("hidden");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "上传并核验";
+    fileInput.value = "";
+  }
+});
+
+const VERIFY_ANOMALY_LABELS = {
+  bad_row: "坏行",
+  duplicate_id: "重复 ID",
+  invalid_line: "非法线路",
+  out_of_range: "区间越界",
+};
+
+function nameCell(name, source) {
+  if (name === null || name === undefined) return '<span class="muted">基准外灯具</span>';
+  const suffix = source === "current"
+    ? ' <span class="muted">（当前名称）</span>'
+    : source === "unavailable"
+      ? ' <span class="muted">（名称不可用）</span>'
+      : "";
+  return `${esc(name)}${suffix}`;
+}
+
+function renderVerifyResult(r) {
+  const box = $("#verify-result");
+  box.classList.remove("hidden");
+
+  const verdictMap = {
+    match: ["ok", "✅ 整表一致", "与所选版本发布落点完全一致（无缺失、额外、不符或重叠）。"],
+    mismatch: ["bad", "❌ 不一致", r.message],
+    rejected: ["warn", "⛔ 整表拒收", r.message],
+  };
+  const [cls, title, message] = verdictMap[r.verdict] || ["bad", "？", r.message || ""];
+
+  const summaryChips = [
+    `基准 ${r.baseline_count} 台`,
+    `现场有效行 ${r.accepted_count} 行`,
+    `缺失 ${r.missing_count}`,
+    `额外 ${r.extra_count}`,
+    `落点不符 ${r.mismatch_count}`,
+    `区间重叠 ${r.overlap_count} 对`,
+    `一致 ${r.matched_count} 台`,
+  ];
+  if (r.isolated_row_count) summaryChips.push(`隔离异常行 ${r.isolated_row_count} 行`);
+
+  const anomaliesTable = !r.anomalies.length ? "" : `
+    <section class="verify-section">
+      <h3>异常行${r.verdict === "rejected" ? "（整表拒收，未进行核对）" : "（已隔离，不参与对齐与重叠判定）"} <span class="count">${r.anomalies.length}</span></h3>
+      <table class="data">
+        <thead><tr><th>CSV 行号</th><th>类型</th><th>灯具ID</th><th>问题</th><th>原始内容</th></tr></thead>
+        <tbody>${r.anomalies.map((x) => `
+          <tr>
+            <td>${x.line ?? "—"}</td>
+            <td><span class="tag tag-anom">${VERIFY_ANOMALY_LABELS[x.type] || x.type}</span></td>
+            <td>${x.fixture_id ?? "—"}</td>
+            <td>${esc(x.message)}</td>
+            <td><code>${esc(["fixture_id", "line_id", "start", "channels"].map((k) => x.raw?.[k] ?? "").join(" | "))}</code></td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+    </section>`;
+
+  const missingTable = section("缺失灯具（基准有、现场没有）", r.missing_count, `
+    <thead><tr><th>灯具ID</th><th>名称</th><th>线路</th><th>起始</th><th>结束</th><th>通道数</th></tr></thead>
+    <tbody>${r.missing.map((b) => `
+      <tr><td>${b.fixture_id}</td><td>${nameCell(b.name, b.name_source)}</td>
+      <td>${b.line_id}</td><td>${b.start}</td><td>${b.end}</td><td>${b.channels}</td></tr>`).join("")}</tbody>`);
+
+  const extraTable = section("额外灯具（现场有、基准没有）", r.extra_count, `
+    <thead><tr><th>灯具ID</th><th>名称</th><th>线路</th><th>起始</th><th>结束</th><th>通道数</th><th>CSV 行号</th></tr></thead>
+    <tbody>${r.extra.map((x) => `
+      <tr><td>${x.fixture_id}</td><td>${nameCell(x.name, x.name_source)}</td>
+      <td>${x.line_id}</td><td>${x.start}</td><td>${x.end}</td><td>${x.channels}</td><td>${x.line_no}</td></tr>`).join("")}</tbody>`);
+
+  // 地址差异与通道差异分别呈现：每行标注三个独立标记，维度列明确给出基准→现场
+  const mismatchTable = section("落点不符（线路 / 地址 / 通道 分别裁决）", r.mismatch_count, `
+    <thead><tr><th>灯具ID</th><th>名称</th><th>不符维度</th>
+      <th>线路（基准 → 现场）</th><th>起始地址（基准 → 现场）</th>
+      <th>闭区间（基准 → 现场）</th><th>通道数（基准 → 现场）</th></tr></thead>
+    <tbody>${r.mismatches.map((m) => {
+      const tags = [
+        m.line_mismatch ? '<span class="tag tag-bad">线路不符</span>' : "",
+        m.address_mismatch ? '<span class="tag tag-bad">地址不符</span>' : "",
+        m.channels_mismatch ? '<span class="tag tag-bad">通道不符</span>' : "",
+      ].join(" ");
+      const cell = (bad) => (bad ? "cell-bad" : "cell-ok");
+      return `
+      <tr>
+        <td>${m.fixture_id}</td><td>${nameCell(m.name, m.name_source)}</td><td>${tags}</td>
+        <td class="${cell(m.line_mismatch)}">${m.baseline.line_id} → ${m.site.line_id}</td>
+        <td class="${cell(m.address_mismatch)}">${m.baseline.start} → ${m.site.start}</td>
+        <td class="${cell(m.address_mismatch || m.channels_mismatch)}">${m.baseline.start}-${m.baseline.end} → ${m.site.start}-${m.site.end}</td>
+        <td class="${cell(m.channels_mismatch)}">${m.baseline.channels} → ${m.site.channels}</td>
+      </tr>`;
+    }).join("")}</tbody>`);
+
+  // 跨行重叠单独成表，与地址差异分开呈现
+  const overlapTable = section("现场区间重叠（现场行之间、同线路闭区间相交）", r.overlap_count, `
+    <thead><tr><th>线路</th><th>重叠区间</th><th>灯具 A（ID/区间/行号）</th><th>灯具 B（ID/区间/行号）</th></tr></thead>
+    <tbody>${r.overlaps.map((o) => `
+      <tr>
+        <td>${o.line_id}</td>
+        <td><span class="tag tag-bad">${o.overlap_start}-${o.overlap_end}（${o.overlap_end - o.overlap_start + 1}ch）</span></td>
+        <td>#${o.a.fixture_id} ${nameCell(o.a.name, o.a.name_source)} ${o.a.start}-${o.a.end} <span class="muted">第 ${o.a.line_no} 行</span></td>
+        <td>#${o.b.fixture_id} ${nameCell(o.b.name, o.b.name_source)} ${o.b.start}-${o.b.end} <span class="muted">第 ${o.b.line_no} 行</span></td>
+      </tr>`).join("")}</tbody>`);
+
+  const matchedTable = section("逐项一致", r.matched_count, `
+    <thead><tr><th>灯具ID</th><th>名称</th><th>线路</th><th>起始</th><th>结束</th><th>通道数</th></tr></thead>
+    <tbody>${r.matched.map((b) => `
+      <tr><td>${b.fixture_id}</td><td>${nameCell(b.name, b.name_source)}</td>
+      <td>${b.line_id}</td><td>${b.start}</td><td>${b.end}</td><td>${b.channels}</td></tr>`).join("")}</tbody>`);
+
+  box.innerHTML = `
+    <div class="verify-verdict ${cls}">
+      <strong>${title}</strong>
+      <span>${esc(message)}</span>
+      <div class="verify-chips">${summaryChips.map((c) => `<span class="verify-chip">${c}</span>`).join("")}</div>
+      <div class="muted">基准来源：${r.baseline_source === "snapshot" ? "发布快照（发布时事实）" : "旧记录留存落点（PlanAllocation 明细）"} · 配置 v${r.config_version}</div>
+    </div>
+    ${anomaliesTable}
+    ${missingTable}
+    ${extraTable}
+    ${mismatchTable}
+    ${overlapTable}
+    ${matchedTable}`;
+  box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function section(titleText, count, tableInner) {
+  if (!count) return "";
+  return `
+    <section class="verify-section">
+      <h3>${titleText} <span class="count">${count}</span></h3>
+      <table class="data">${tableInner}</table>
+    </section>`;
 }
 
 // ---------- 启动 ----------
